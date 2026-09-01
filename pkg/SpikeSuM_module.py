@@ -53,6 +53,28 @@ class SpikeSuM(object):
 
         # ---- Self-calibrating surprise threshold (off by default) ---------
         #     theta = a + b * ln(K_est)
+        # Additive mode: theta = EMA(A~) + c. The margin is invariant, so if
+        # learning drags A~ down theta follows by the same amount and the
+        # crossing rate is unchanged -- loop gain zero to first order, no
+        # freezing needed. Measured drift -0.4% over a 5x longer run, against
+        # -64% for a multiplicative rule.
+        #
+        # Hybrid: theta = EMA(A~) + a + b*ln(K_est). The mean tracks the level,
+        # the histogram supplies the margin, which is the only term that
+        # changes sign with K (-0.085 at K=2, +0.114 at K=8).
+        self.hybrid_theta = params.get("hybrid_theta", False)
+        self.mean_theta = params.get("mean_theta", False)
+        if self.hybrid_theta:
+            self.hyb_a = params.get("hyb_a", -0.2470)
+            self.hyb_b = params.get("hyb_b", 0.1810)
+        if self.mean_theta or self.hybrid_theta:
+            self.mean_c = params.get("mean_c", 0.05)
+            self.mean_tau = params.get("mean_tau", 300.0)
+            self.mean_warmup = params.get("mean_warmup", 200)
+            self.mean_lam = float(math.exp(-1.0 / self.mean_tau))
+            self.mean_A = None
+            self.mean_epoch = 0
+
         self.exo_theta = params.get("exo_theta", False)
         if self.exo_theta:
             self.exo_a = params.get("exo_a", -0.0833)
@@ -288,6 +310,30 @@ class SpikeSuM(object):
         if float(score.max()) > 0:
             self.exo_room = int(torch.argmax(score[0]))
 
+    def update_mean_theta(self):
+        """theta = EMA(A~) + margin. Additive, so the margin is invariant.
+
+        Only rectified activity is averaged: in SpikeSuM-C the modules the
+        selector inhibits sit at A~ around -9595 and would drag the mean.
+        """
+        a = self.network_activity.detach()
+        act = a[a > 0]
+        if act.numel():
+            cur = float(act.mean())
+            self.mean_A = cur if self.mean_A is None else (
+                self.mean_A + (1 - self.mean_lam) * (cur - self.mean_A))
+        self.mean_epoch += 1
+        if self.mean_A is None or self.mean_epoch <= self.mean_warmup:
+            return
+        if self.hybrid_theta:
+            k = max(self.exo_keff, 1.05)
+            margin = self.hyb_a + self.hyb_b * math.log(k)
+        else:
+            margin = self.mean_c
+        self.theta = torch.full_like(
+            torch.as_tensor(self.theta).float().reshape(-1),
+            self.mean_A + margin).reshape(1, -1)
+
     def update_exo_theta(self):
         """Slow histogram of observed transitions -> K_est -> theta."""
         self.exo_epoch += 1
@@ -300,6 +346,8 @@ class SpikeSuM(object):
             P = self.exo_C / self.exo_C.sum(dim=1, keepdim=True)
             self.exo_keff = float((1.0 / (P ** 2).sum(dim=1)).mean())
 
+        if self.hybrid_theta:
+            return
         if self.exo_epoch == self.exo_freeze:
             k = max(self.exo_keff, 1.05)
             self.exo_frozen = self.exo_a + self.exo_b * math.log(k)
@@ -380,8 +428,10 @@ class SpikeSuM(object):
         Return None
         """
 
-        if self.exo_theta:
+        if self.exo_theta or self.hybrid_theta:
             self.update_exo_theta()
+        if self.mean_theta or self.hybrid_theta:
+            self.update_mean_theta()
 
         T_hat = self.estimate_T()
 
@@ -444,7 +494,7 @@ class SpikeSuM(object):
         return: Average weight update and commitment modulation for disinhibitory neurons
         """
         
-        if self.exo_theta:
+        if self.exo_theta or self.hybrid_theta:
             self.decode_observed_room(EPSC_observation)
 
         I = (self.sign * (torch.einsum("bijk,bij->bik",  # noqa: E741
@@ -477,8 +527,7 @@ class SpikeSuM(object):
             self.info["Activity_P2"] += [torch.mean(torch.sum(self.filtered_activity_nohin[:,1],dim = 1)).cpu()]
             self.info["Activity"] += [self.network_activity.detach().clone()]
 
-        print[torch.mean(torch.sum(self.filtered_activity_nohin[:,0],dim = 1)).cpu()]
-        
+        self.info["Activity_P1"] += [torch.mean(torch.sum(self.filtered_activity_nohin[:,0],dim = 1)).cpu()]
         third = self.third_factor(self.network_activity).detach()
         commitement_modulation = (third > 0 ) * (1 - 2 * (third > self.third_factor(self.theta)))
         prediction_modulation = third.detach()
